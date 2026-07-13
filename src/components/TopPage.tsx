@@ -29,8 +29,7 @@ export function TopPage() {
       <section className="mb-10">
         <p className="mb-2 font-mono text-[12px] tracking-widest text-ink-faint">INDUSTRIAL IDE DOCS — CROSS-VENDOR REFERENCE</p>
         <h1 className="text-2xl font-bold leading-snug md:text-3xl">
-          同じ概念、3つの呼び名。<br className="md:hidden" />
-          PLC開発環境マニュアルを<span className="underline decoration-paper-line decoration-4 underline-offset-4">共通構造</span>で引く。
+          Industrial IDE Docs
         </h1>
         <p className="mt-3 max-w-2xl text-sm leading-6 text-ink-soft">
           三菱電機 GX Works3・キーエンス KV STUDIO・オムロン Sysmac Studio のマニュアルを、
