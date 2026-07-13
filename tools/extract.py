@@ -10,13 +10,13 @@ import fitz, re, os, io, json, unicodedata
 from collections import defaultdict
 from PIL import Image
 
-IMG_OUT = "/home/claude/work/site/public/images"
+IMG_OUT = "/home/claude/work2/user-site/public/images"
 IMG_ZOOM = 2.0
 IMG_MAX_W = 1600
 IMG_QUALITY = 76
 
 SRC = "/home/claude/work/pdfs"
-OUT = "/home/claude/work/site/public/content"
+OUT = "/home/claude/work2/user-site/public/content"
 
 CATEGORIES = [
     ("setup",       "導入・画面・基本操作"),
@@ -271,20 +271,63 @@ def join_lines(lines):
             out += ln
     return out
 
-def table_md(tbl):
+def _table_rows(tbl, vendor):
     rows = tbl.extract()
-    rows = [[re.sub(r"\s*\n\s*", " ", (c or "")).strip() for c in r] for r in rows]
+    rows = [[map_pua(vendor, re.sub(r"\s*\n\s*", " ", (c or ""))).strip() for c in r] for r in rows]
     rows = [r for r in rows if any(r)]
-    if len(rows) < 2 or max(len(r) for r in rows) < 2: return None
+    return rows
+
+def _rows_to_md(rows):
     ncol = max(len(r) for r in rows)
+    rows = [r + [""] * (ncol - len(r)) for r in rows]
+    # 全行で空の列を削除
+    keep = [ci for ci in range(ncol) if any(r[ci] for r in rows)]
+    if len(keep) < 2: return None
+    rows = [[r[ci] for ci in keep] for r in rows]
+    ncol = len(keep)
     filled = sum(1 for r in rows for c in r if c)
-    if filled < len(rows)*ncol*0.25: return None
+    fill = filled / (len(rows) * ncol)
+    # 誤検出とみられる小規模・低充足の表はテキストに降格
+    if len(rows) <= 3 and fill < 0.40:
+        return "\n\n".join(" ".join(c for c in r if c) for r in rows if any(r))
+    if len(rows) < 2 or fill < 0.2: return None
     def esc(c): return c.replace("|", "\\|")
-    md = "| " + " | ".join(esc(c) for c in rows[0] + [""]*(ncol-len(rows[0]))) + " |\n"
-    md += "|" + "---|"*ncol + "\n"
+    md = "| " + " | ".join(esc(c) for c in rows[0]) + " |\n"
+    md += "|" + "---|" * ncol + "\n"
     for r in rows[1:]:
-        md += "| " + " | ".join(esc(c) for c in r + [""]*(ncol-len(r))) + " |\n"
+        md += "| " + " | ".join(esc(c) for c in r) + " |\n"
     return md
+
+def page_tables(page, vendor):
+    """表の検出→分割ヘッダの結合→Markdown化。[(bbox, md_or_text, is_table)]を返す"""
+    try:
+        tf = page.find_tables()
+    except Exception:
+        return []
+    raw = []
+    for t in tf.tables:
+        rows = _table_rows(t, vendor)
+        if not rows: continue
+        raw.append([list(t.bbox), rows])
+    raw.sort(key=lambda x: x[0][1])
+    # 縦に隣接し列数が同じ表を結合(ヘッダ分割対策)
+    merged = []
+    for bb, rows in raw:
+        if merged:
+            pbb, prows = merged[-1]
+            same_cols = max(len(r) for r in rows) == max(len(r) for r in prows)
+            if (same_cols and 0 <= bb[1] - pbb[3] < 10
+                    and abs(bb[0] - pbb[0]) < 20 and abs(bb[2] - pbb[2]) < 20):
+                prows.extend(rows)
+                pbb[2] = max(pbb[2], bb[2]); pbb[3] = bb[3]
+                continue
+        merged.append([bb, rows])
+    out = []
+    for bb, rows in merged:
+        md = _rows_to_md(rows)
+        if md is None: continue
+        out.append((bb, md, md.lstrip().startswith("|")))
+    return out
 
 # ---------------------------------------------------------------- unit rendering
 def render_unit(doc, cfg, unit, next_unit, subheads):
@@ -300,16 +343,11 @@ def render_unit(doc, cfg, unit, next_unit, subheads):
     key = norm(unit["num"]) + norm(unit["title"])[:10]
     for pn in range(p_start, p_end+1):
         page = doc[pn]
-        try:
-            tf = page.find_tables()
-            tables = [(t.bbox, table_md(t)) for t in tf.tables]
-        except Exception:
-            tables = []
-        tables = [(bb, md) for bb, md in tables if md]
-        figs = detect_figures(page, cfg, [bb for bb,_ in tables])
-        items = page_items(page, cfg, [bb for bb,_ in tables], figs)
-        for bb, md in tables:
-            items.append([bb[1], bb[0], "table", md, 0, False])
+        tables = page_tables(page, unit["_vendor"])
+        figs = detect_figures(page, cfg, [bb for bb, _, _ in tables])
+        items = page_items(page, cfg, [bb for bb, _, _ in tables], figs)
+        for bb, md, is_tab in tables:
+            items.append([bb[1], bb[0], "table" if is_tab else "p", md, 0, False])
         for fb in figs:
             md_img = render_figure(page, fb, unit["_vendor"], unit["slug"], unit["_figseq"], pn+1)
             if md_img:
@@ -369,6 +407,38 @@ def render_unit(doc, cfg, unit, next_unit, subheads):
     return parts, started
 
 # ---------------------------------------------------------------- post-processing
+# PUAグリフ → 出力文字列(凡例文+ピクセル形状解析で確定、キー記号はCodex裏取り待ち)
+PUA_MAP_COMMON = {
+    "\uf0ae": "→",    # Symbol 0xAE 右矢印
+    "\uf0d7": "・",   # Symbol 0xD7 箇条書き点
+}
+PUA_MAP = {
+    "gxworks3": {
+        **PUA_MAP_COMMON,
+        "\uf0c6": "○", "\uf0c7": "△", "\uf0c8": "×", "\uf0c9": "―",
+        "\uf06f": "□",              # Wingdings 'o' プレースホルダ
+        "\uf0f0": " ⇒ ",            # Wingdings メニュー経路矢印
+        "\uf0c0": "→ ",             # マニュアル参照アイコン
+        "\uf0c1": "→ ",             # ページ参照アイコン
+        "\uf0fb": "・",             # 機能項目アイコン
+        "\uf083": "[Ctrl]", "\uf084": "[Shift]", "\uf08f": "[Enter]",
+        "\uf081": "[Tab]", "\uf082": "[Alt]", "\uf085": "[Esc]", "\uf08c": "[Space]",
+        "\uf0bc": "[↑]", "\uf0bd": "[↓]", "\uf0be": "[←]", "\uf0bf": "[→]",
+    },
+    "kvstudio": {
+        **PUA_MAP_COMMON,
+        "\uf06c": "●", "\uf06e": "■",   # Wingdings l/n
+        "\uf075": "►", "\uf067": "→",   # Wingdings3(Codex裏取り済)
+        "\uf0ac": "←", "\uf0ad": "↑", "\uf0af": "↓",  # Symbol矢印系
+    },
+    "sysmac": dict(PUA_MAP_COMMON),
+}
+
+def map_pua(vendor, text):
+    for k, v in PUA_MAP.get(vendor, {}).items():
+        if k in text: text = text.replace(k, v)
+    return text
+
 PUA = re.compile(r"[\ue000-\uf8ff]")
 
 def postprocess(vendor, parts):
@@ -385,6 +455,7 @@ def postprocess(vendor, parts):
     for kind, text in out:
         if kind == "img":
             res.append((kind, text)); continue
+        text = map_pua(vendor, text)
         if vendor == "gxworks3":
             text = text.replace("，", "、").replace("．", "。")
             text = re.sub(r"[\ue000-\uf8ff]\s*(\d+)ページ\s*", "→ ", text)
@@ -405,6 +476,7 @@ def postprocess(vendor, parts):
             if text.startswith("■"):
                 t = text[1:].strip()
                 text = f"**{t}**" if len(t) < 60 else t
+        text = re.sub(r"→ *→ *", "→ ", text)
         text = re.sub(r"[・.]{3,}", " ", text).strip()
         if not text: continue
         if kind == "p" and text.count("•") >= 2:
@@ -474,6 +546,8 @@ def main():
             u["slug"] = slug_num(u["num"])
             u["_vendor"] = vendor
             u["_figseq"] = 1
+            if os.path.exists(f"{OUT}/{vendor}/{u['slug']}.md"):
+                continue  # レジューム: 生成済みはスキップ
             nxt = units[i+1] if i+1 < len(units) else None
             end = (nxt["page"] if nxt else doc.page_count)
             nb = [b for b in breaks if b > u["page"]]
