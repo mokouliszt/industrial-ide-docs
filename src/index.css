@@ -1,0 +1,34 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  html { -webkit-font-smoothing: antialiased; }
+  body { @apply bg-paper font-sans text-ink; }
+  ::selection { @apply bg-ink text-paper; }
+}
+
+/* Markdown本文のタイポグラフィ */
+.doc-body { @apply text-[14px] leading-7 text-ink; }
+.doc-body h1 { @apply mb-4 mt-2 text-[22px] font-bold leading-snug; }
+.doc-body h2 { @apply mb-3 mt-9 border-b border-paper-line pb-1.5 text-[17px] font-bold; }
+.doc-body h3 { @apply mb-2 mt-7 text-[15px] font-bold; }
+.doc-body h3::before { content: "—"; @apply mr-1.5 text-ink-faint; }
+.doc-body h4 { @apply mb-1.5 mt-5 text-[14px] font-semibold text-ink-soft; }
+.doc-body p { @apply my-2.5; }
+.doc-body ul { @apply my-2.5 list-disc space-y-1 pl-5; }
+.doc-body ol { @apply my-2.5 list-decimal space-y-1 pl-5; }
+.doc-body li > p { @apply my-0; }
+.doc-body strong { @apply font-semibold; }
+.doc-body a { @apply underline underline-offset-2; }
+.doc-body code { @apply rounded bg-paper-panel px-1 py-0.5 font-mono text-[12.5px]; }
+.doc-body table { @apply my-4 block w-full max-w-full overflow-x-auto border-collapse text-[12.5px] leading-5; }
+.doc-body thead { @apply bg-paper-panel; }
+.doc-body th { @apply border border-paper-line px-2.5 py-1.5 text-left font-semibold; }
+.doc-body td { @apply border border-paper-line px-2.5 py-1.5 align-top; }
+.doc-body tr:nth-child(even) td { @apply bg-paper-panel/40; }
+.doc-body hr { @apply my-8 border-paper-line; }
+.doc-body blockquote { @apply my-3 border-l-2 border-paper-line pl-3 text-ink-soft; }
+
+.doc-body .doc-figure { @apply my-3 inline-block max-w-full rounded border border-paper-line bg-white p-1 shadow-sm; }
+.doc-body p:has(> a > .doc-figure) { @apply my-3; }
