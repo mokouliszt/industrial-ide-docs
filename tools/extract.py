@@ -234,6 +234,7 @@ def page_items(page, cfg, table_bboxes, fig_bboxes=()):
         if b["type"] != 0: continue
         lines, maxsz, bold = [], 0.0, False
         by0 = bx0 = None
+        prev_lb = None
         for l in b["lines"]:
             if abs(l["dir"][0]) < 0.5: continue  # 縦書き(サイドタブ)除去
             lx0,ly0,lx1,ly1 = l["bbox"]
@@ -245,7 +246,21 @@ def page_items(page, cfg, table_bboxes, fig_bboxes=()):
                 continue  # 図領域内のテキストは図として出力するため除外
             t = "".join(s["text"] for s in l["spans"])
             if not t.strip(): continue
+            # 同一Y帯で右側に離れた行(罫線なしラベル行)は「：」で結合
+            l_size = max((s["size"] for s in l["spans"] if s["text"].strip()), default=0)
+            if lines and prev_lb is not None and l_size < 11.5 \
+                    and not re.fullmatch(r"[0-9.\-]{1,8}", lines[-1].strip()):
+                py0, py1, px1 = prev_lb
+                y_overlap = min(ly1, py1) - max(ly0, py0)
+                if y_overlap > (ly1 - ly0) * 0.5 and lx0 > px1 + 6:
+                    prev = lines[-1]
+                    sep = "：" if (len(prev) <= 24 and "。" not in prev
+                                   and not prev.endswith(("：", ":", "、", "，"))) else " "
+                    lines[-1] = prev + sep + t
+                    prev_lb = (min(py0, ly0), max(py1, ly1), lx1)
+                    continue
             lines.append(t)
+            prev_lb = (ly0, ly1, lx1)
             if by0 is None: by0, bx0 = ly0, lx0
             for s in l["spans"]:
                 if s["text"].strip():
@@ -271,7 +286,33 @@ def join_lines(lines):
             out += ln
     return out
 
-def _table_rows(tbl, vendor):
+def _table_rows(tbl, vendor, page=None):
+    """find_tablesのセル欠落(結合セル列)対策: 行/列境界からグリッドを再構成し、
+    各セルをclip抽出で埋める。"""
+    cells = [c for c in tbl.cells if c]
+    if page is not None and cells:
+        xs = sorted({round(v, 1) for c in cells for v in (c[0], c[2])})
+        ys = sorted({round(v, 1) for c in cells for v in (c[1], c[3])})
+        # 近接エッジを統合
+        def dedup(vals, tol=3.0):
+            out = [vals[0]]
+            for v in vals[1:]:
+                if v - out[-1] > tol: out.append(v)
+            return out
+        xs, ys = dedup(xs), dedup(ys)
+        if 2 <= len(xs) <= 24 and 2 <= len(ys) <= 200:
+            rows = []
+            for ri in range(len(ys) - 1):
+                row = []
+                for ci in range(len(xs) - 1):
+                    clip = fitz.Rect(xs[ci] + 1, ys[ri] + 1, xs[ci + 1] - 1, ys[ri + 1] - 1)
+                    t = page.get_text("text", clip=clip)
+                    t = map_pua(vendor, join_lines([ln for ln in t.split("\n") if ln.strip()])).strip()
+                    row.append(t)
+                rows.append(row)
+            rows = [r for r in rows if any(r)]
+            if rows:
+                return rows
     rows = tbl.extract()
     rows = [[map_pua(vendor, re.sub(r"\s*\n\s*", " ", (c or ""))).strip() for c in r] for r in rows]
     rows = [r for r in rows if any(r)]
@@ -280,8 +321,13 @@ def _table_rows(tbl, vendor):
 def _rows_to_md(rows):
     ncol = max(len(r) for r in rows)
     rows = [r + [""] * (ncol - len(r)) for r in rows]
-    # 全行で空の列を削除
-    keep = [ci for ci in range(ncol) if any(r[ci] for r in rows)]
+    # 全行で空の列を削除 + ボディ全空(画像セル)列も削除(行数が十分な場合)
+    def col_keep(ci):
+        col = [r[ci] for r in rows]
+        if not any(col): return False
+        if len(rows) >= 4 and col[0] and not any(col[1:]): return False
+        return True
+    keep = [ci for ci in range(ncol) if col_keep(ci)]
     if len(keep) < 2: return None
     rows = [[r[ci] for ci in keep] for r in rows]
     ncol = len(keep)
@@ -289,7 +335,7 @@ def _rows_to_md(rows):
     fill = filled / (len(rows) * ncol)
     # 誤検出とみられる小規模・低充足の表はテキストに降格
     if len(rows) <= 3 and fill < 0.40:
-        return "\n\n".join(" ".join(c for c in r if c) for r in rows if any(r))
+        return "\n\n".join(": ".join(c for c in r if c) for r in rows if any(r))
     if len(rows) < 2 or fill < 0.2: return None
     def esc(c): return c.replace("|", "\\|")
     md = "| " + " | ".join(esc(c) for c in rows[0]) + " |\n"
@@ -306,7 +352,7 @@ def page_tables(page, vendor):
         return []
     raw = []
     for t in tf.tables:
-        rows = _table_rows(t, vendor)
+        rows = _table_rows(t, vendor, page)
         if not rows: continue
         raw.append([list(t.bbox), rows])
     raw.sort(key=lambda x: x[0][1])
@@ -341,6 +387,7 @@ def render_unit(doc, cfg, unit, next_unit, subheads):
     sub_by_norm = {norm(t): lv for (lv, t, pg) in subheads}
 
     key = norm(unit["num"]) + norm(unit["title"])[:10]
+    last_py = None
     for pn in range(p_start, p_end+1):
         page = doc[pn]
         tables = page_tables(page, unit["_vendor"])
@@ -363,6 +410,16 @@ def render_unit(doc, cfg, unit, next_unit, subheads):
             if pn == p_start and not started:
                 if key in tn or tn == title_n:
                     started = True
+                    flat = text.replace("\n", "")
+                    raw_m = re.search(re.escape(unit["num"]) + r"\s*", flat)
+                    if raw_m:
+                        after = flat[raw_m.end():]
+                        tfrag = unit["title"].replace(" ", "")
+                        if after.replace(" ", "").startswith(tfrag[:6]):
+                            idx = len(tfrag)
+                            suffix = after[idx:].strip() if len(after) > idx else ""
+                            if len(suffix) > 8:
+                                parts.append(("p", suffix))
                     continue  # ユニットタイトル自体は出力しない(H1はfrontmatter側)
                 else:
                     continue
@@ -374,11 +431,21 @@ def render_unit(doc, cfg, unit, next_unit, subheads):
             if sz >= cfg["title_size"] and (title_n in tn or key in tn):
                 continue  # タイトル再掲は捨てる
             if pn == p_end and next_n and (sz >= cfg["title_size"] or tn == next_n):
+                # 本文+次節タイトルが1ブロックに結合している場合、タイトル手前まで出力
+                if next_unit:
+                    flat = text.replace("\n", "")
+                    m = re.search(re.escape(next_unit["num"]) + r"\s*" +
+                                  re.escape(norm(next_unit["title"])[:6]), norm(flat))
+                    raw_m = re.search(re.escape(next_unit["num"]), flat)
+                    if raw_m and raw_m.start() > 4:
+                        prefix = flat[:raw_m.start()].strip()
+                        if len(prefix) > 4:
+                            parts.append(("p", prefix))
                 return parts, started
             if kind == "table":
-                parts.append(("table", text)); continue
+                parts.append(("table", text)); last_py = None; continue
             if kind == "img":
-                parts.append(("img", text)); continue
+                parts.append(("img", text)); last_py = None; continue
             # 見出し判定: TOC一致を優先、次にサイズ
             matched = None
             for k, lv in sub_by_norm.items():
@@ -388,22 +455,42 @@ def render_unit(doc, cfg, unit, next_unit, subheads):
                 ht = re.sub(r"^((?:\d+|付\d*|A)(?:[.\-]\d+)*)(?=[^\d\s.\-])", r"\1 ", text.strip())
                 parts.append(("h", "#"*min(matched,5) + " " + ht))
                 continue
+            # 「操作手順」ラベル付きブロックは見出しにせず分解
+            if text.startswith("操作手順"):
+                parts.append(("p", "**操作手順**"))
+                rest = text[4:].strip()
+                if rest:
+                    for seg in re.split(r"(?<=[。す])\s*(?=[1-9]\d?\.)", rest):
+                        seg = seg.strip()
+                        if seg: parts.append(("p", seg))
+                continue
             # 操作手順の番号(大フォント)を段落化
             ms = re.match(r"^([1-9]\d?)(\D.{10,})", text)
             if ms and sz >= 11 and (len(text) >= 26 or
                     text.rstrip().endswith(("。", "ます", "さい", "す)", "す）"))):
                 parts.append(("p", f"{ms.group(1)}. {ms.group(2).strip()}")); continue
-            if sz >= cfg["title_size"]:  # 境界検出漏れ対策
-                parts.append(("h", "## " + text.strip())); continue
+            if sz >= cfg["title_size"] and "。" not in text and len(text) < 60:  # 境界検出漏れ対策
+                parts.append(("h", "## " + text.strip())); last_py = None; continue
             hlv = None
             for smin, lv in cfg["h_tiers"]:
-                if (sz >= smin and bold and len(text) < 70 and not text.endswith("。")
+                if (sz >= smin and bold and len(text) < 55 and "。" not in text
+                        and not text.endswith(("しま", "できま", "されま", "につい", "を行", "とな"))
                         and not re.match(r"^[1-9]\d?[^\d.\-]", text)):
                     hlv = lv; break
             if hlv:
                 parts.append(("h", "#"*hlv + " " + text.strip()))
+                last_py = None
             else:
-                parts.append(("p", text))
+                if (parts and parts[-1][0] == "p" and last_py is not None
+                        and abs(y - last_py) < 4 and x > 60):
+                    prev = parts[-1][1]
+                    sep = "：" if (len(prev) <= 24 and "。" not in prev
+                                   and not prev.endswith(("：", ":", "、"))) else ""
+                    parts[-1] = ("p", prev + sep + text)
+                else:
+                    parts.append(("p", text))
+                    last_py = y
+            continue
     return parts, started
 
 # ---------------------------------------------------------------- post-processing
@@ -477,6 +564,7 @@ def postprocess(vendor, parts):
                 t = text[1:].strip()
                 text = f"**{t}**" if len(t) < 60 else t
         text = re.sub(r"→ *→ *", "→ ", text)
+        text = re.sub(r"(?<![0-9A-Za-z_()])_ ?_(?![0-9A-Za-z_()])", " ", text)
         text = re.sub(r"[・.]{3,}", " ", text).strip()
         if not text: continue
         if kind == "p" and text.count("•") >= 2:
@@ -487,12 +575,24 @@ def postprocess(vendor, parts):
                 continue
         text = re.sub(r"^•\s*", "- ", text)
         res.append((kind, text))
+    # 段落内に連結した番号手順を分割
+    split_res = []
+    for kind, text in res:
+        if kind == "p" and re.search(r"[。す]\s*[1-9]\d?\.\s*\D", text) and len(text) > 40:
+            segs = re.split(r"(?<=[。])\s*(?=[1-9]\d?\.\s*\D)", text)
+            for seg in segs:
+                seg = seg.strip()
+                if seg: split_res.append((kind, seg))
+        else:
+            split_res.append((kind, text))
+    res = split_res
     # 折返しで分断された段落を結合
     merged = []
     for kind, text in res:
         if (merged and kind == "p" and merged[-1][0] == "p"):
             prev = merged[-1][1]
-            if (len(prev) >= 8 and not prev.endswith(("。", "！", "？", "：", "」", "）", ")", ">", "*"))
+            if (len(prev) >= 8 and "：" not in prev
+                    and not prev.endswith(("。", "！", "？", "：", "」", "）", ")", ">", "*"))
                     and re.match(r"[\u3040-\u30ff\u4e00-\u9fff、]", prev[-1])
                     and re.match(r"[\u3040-\u30ff\u4e00-\u9fff（「]", text[:1])
                     and not text.startswith(("- ", "**"))):
