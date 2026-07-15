@@ -252,10 +252,15 @@ def page_items(page, cfg, table_bboxes, fig_bboxes=()):
                     and not re.fullmatch(r"[0-9.\-]{1,8}", lines[-1].strip()):
                 py0, py1, px1 = prev_lb
                 y_overlap = min(ly1, py1) - max(ly0, py0)
-                if y_overlap > (ly1 - ly0) * 0.5 and lx0 > px1 + 6:
+                if y_overlap > (ly1 - ly0) * 0.5 and lx0 > px1 + 3:
                     prev = lines[-1]
-                    sep = "：" if (len(prev) <= 24 and "。" not in prev
-                                   and not prev.endswith(("：", ":", "、", "，"))) else " "
+                    if len(t.strip()) <= 1 or lx0 <= px1 + 10:
+                        sep = ""   # 字間の広い見出し等は無区切りで連結
+                    elif (len(prev) <= 24 and "。" not in prev
+                          and not prev.endswith(("：", ":", "、", "，"))):
+                        sep = "："
+                    else:
+                        sep = " "
                     lines[-1] = prev + sep + t
                     prev_lb = (min(py0, ly0), max(py1, ly1), lx1)
                     continue
@@ -286,57 +291,160 @@ def join_lines(lines):
             out += ln
     return out
 
-def _table_rows(tbl, vendor, page=None):
-    """find_tablesのセル欠落(結合セル列)対策: 行/列境界からグリッドを再構成し、
-    各セルをclip抽出で埋める。"""
-    cells = [c for c in tbl.cells if c]
-    if page is not None and cells:
-        xs = sorted({round(v, 1) for c in cells for v in (c[0], c[2])})
-        ys = sorted({round(v, 1) for c in cells for v in (c[1], c[3])})
-        # 近接エッジを統合
-        def dedup(vals, tol=3.0):
-            out = [vals[0]]
-            for v in vals[1:]:
-                if v - out[-1] > tol: out.append(v)
-            return out
-        xs, ys = dedup(xs), dedup(ys)
-        if 2 <= len(xs) <= 24 and 2 <= len(ys) <= 200:
-            rows = []
-            for ri in range(len(ys) - 1):
-                row = []
-                for ci in range(len(xs) - 1):
-                    clip = fitz.Rect(xs[ci] + 1, ys[ri] + 1, xs[ci + 1] - 1, ys[ri + 1] - 1)
-                    t = page.get_text("text", clip=clip)
-                    t = map_pua(vendor, join_lines([ln for ln in t.split("\n") if ln.strip()])).strip()
-                    row.append(t)
-                rows.append(row)
-            rows = [r for r in rows if any(r)]
-            if rows:
-                return rows
-    rows = tbl.extract()
-    rows = [[map_pua(vendor, re.sub(r"\s*\n\s*", " ", (c or ""))).strip() for c in r] for r in rows]
-    rows = [r for r in rows if any(r)]
-    return rows
+def _cell_text(vendor, t):
+    return map_pua(vendor, join_lines([ln for ln in t.split("\n") if ln.strip()])).strip()
 
-def _rows_to_md(rows):
+def _table_rows(tbl, vendor, page=None):
+    """ハイブリッド抽出: 健全なセルはextract()を採用し、セル欠落領域のみ
+    行センター割当で救済する(結合セルの行割れ・語切断を防止)。"""
+    ext = tbl.extract()
+    ext = [[map_pua(vendor, re.sub(r"\s*\n\s*", " ", (c or ""))).strip() for c in r] for r in ext]
+    cells = [c for c in tbl.cells if c]
+    if page is None or not cells:
+        return [r for r in ext if any(r)]
+    bb = tbl.bbox
+    total = max((bb[2]-bb[0]) * (bb[3]-bb[1]), 1)
+    covered = sum((c[2]-c[0]) * (c[3]-c[1]) for c in cells)
+    if covered / total >= 0.97:
+        # 結合セル(None矩形)の値を下方向へ引き継ぐ(各行を自己完結に)
+        for r in range(1, len(tbl.rows)):
+            for c, rect in enumerate(tbl.rows[r].cells):
+                if rect is not None or c >= len(ext[r]) or ext[r][c]:
+                    continue
+                for r0 in range(r - 1, -1, -1):
+                    R = tbl.rows[r0].cells[c] if c < len(tbl.rows[r0].cells) else None
+                    if R is not None:
+                        row_ys = [v for cc in tbl.rows[r].cells if cc for v in (cc[1], cc[3])]
+                        if row_ys and R[3] >= min(row_ys) - 2 and c < len(ext[r0]) and ext[r0][c]:
+                            ext[r][c] = ext[r0][c]
+                        break
+        return [r for r in ext if any(r)]
+    # --- 救済モード: グリッド構築 ---
+    xs = sorted({round(v, 1) for c in cells for v in (c[0], c[2])})
+    ys = sorted({round(v, 1) for c in cells for v in (c[1], c[3])})
+    def dedup(vals, tol=3.0):
+        out = [vals[0]]
+        for v in vals[1:]:
+            if v - out[-1] > tol: out.append(v)
+        return out
+    xs, ys = dedup(xs), dedup(ys)
+    if not (2 <= len(xs) <= 24 and 2 <= len(ys) <= 200):
+        return [r for r in ext if any(r)]
+    nR, nC = len(ys) - 1, len(xs) - 1
+    grid = [["" for _ in range(nC)] for _ in range(nR)]
+    cov = [[False] * nC for _ in range(nR)]
+    def cell_at(x, y):
+        ci = ri = None
+        for i in range(nC):
+            if xs[i] <= x < xs[i+1]: ci = i; break
+        else:
+            if x >= xs[-1]: ci = nC - 1
+        for j in range(nR):
+            if ys[j] <= y < ys[j+1]: ri = j; break
+        else:
+            if y >= ys[-1]: ri = nR - 1
+        return ri, ci
+    # 既知セルのテキストを配置(extract()の行と tbl.rows の矩形が対応)
+    for ri_e, trow in enumerate(tbl.rows):
+        for ci_e, rect in enumerate(trow.cells):
+            if rect is None: continue
+            gr, gc = cell_at((rect[0]+rect[2])/2, (rect[1]+rect[3])/2)
+            r0, c0 = cell_at(rect[0]+2, rect[1]+2)
+            tr, tc = (r0 if r0 is not None else gr), (c0 if c0 is not None else gc)
+            if tr is None or tc is None: continue
+            txt = ext[ri_e][ci_e] if ri_e < len(ext) and ci_e < len(ext[ri_e]) else ""
+            if txt and not grid[tr][tc]:
+                grid[tr][tc] = txt
+            # 被覆マーク(セル矩形が跨る全グリッドセル)
+            for j in range(nR):
+                for i in range(nC):
+                    cx, cy = (xs[i]+xs[i+1])/2, (ys[j]+ys[j+1])/2
+                    if rect[0]-1 <= cx <= rect[2]+1 and rect[1]-1 <= cy <= rect[3]+1:
+                        cov[j][i] = True
+    # 未被覆領域: 列ごとの縦連続runに行センターでテキスト行を割当
+    dlines = []
+    for b in page.get_text("dict")["blocks"]:
+        if b["type"]: continue
+        for l in b["lines"]:
+            if abs(l["dir"][0]) < 0.5: continue
+            lt = "".join(s["text"] for s in l["spans"]).strip()
+            if lt: dlines.append((l["bbox"], lt))
+    for ci in range(nC):
+        j = 0
+        while j < nR:
+            if cov[j][ci]: j += 1; continue
+            k = j
+            while k < nR and not cov[k][ci]: k += 1
+            run = (xs[ci], ys[j], xs[ci+1], ys[k])   # 未被覆run
+            frag = [[] for _ in range(j, k)]
+            for (lx0, ly0, lx1, ly1), lt in dlines:
+                cx, cy = (lx0+lx1)/2, (ly0+ly1)/2
+                if run[0]-1 <= cx <= run[2]+1 and run[1] <= cy <= run[3]:
+                    for rj in range(j, k):
+                        if ys[rj] <= cy <= ys[rj+1]:
+                            frag[rj-j].append((ly0, lx0, lt)); break
+            texts = []
+            for fl in frag:
+                fl.sort()
+                texts.append(join_lines([t for _, _, t in fl]))
+            # 行間で文が続いている(結合セル)ならrun先頭に集約
+            spill = any(t and re.match(r"[ぁ-ん、。]", t) for t in texts[1:]) or                     any(t and t[-1] in "、（(" for t in texts[:-1])
+            if spill:
+                whole = map_pua(vendor, join_lines([t for t in texts if t])).strip()
+                for rj in range(j, k): grid[rj][ci] = whole
+            else:
+                for idx, rj in enumerate(range(j, k)):
+                    grid[rj][ci] = map_pua(vendor, texts[idx]).strip()
+            j = k
+    rows = [r for r in grid if any(r)]
+    return rows if rows else [r for r in ext if any(r)]
+
+def _clean_cols(rows):
     ncol = max(len(r) for r in rows)
     rows = [r + [""] * (ncol - len(r)) for r in rows]
-    # 全行で空の列を削除 + ボディ全空(画像セル)列も削除(行数が十分な場合)
     def col_keep(ci):
         col = [r[ci] for r in rows]
         if not any(col): return False
         if len(rows) >= 4 and col[0] and not any(col[1:]): return False
         return True
     keep = [ci for ci in range(ncol) if col_keep(ci)]
-    if len(keep) < 2: return None
-    rows = [[r[ci] for ci in keep] for r in rows]
-    ncol = len(keep)
+    return [[r[ci] for ci in keep] for r in rows]
+
+CALLOUT_LABELS = ("注意", "ポイント", "参考", "重要", "警告")
+
+def _rows_to_md(rows):
+    flat = [c for r in rows for c in r if c]
+    if len(flat) <= 4 and any(len(c) > 150 for c in flat):
+        return None  # 囲み枠をテーブル誤検出したケース
+    if sum(len(c) for c in flat) < 14:
+        return None  # 中身のないゴミ表
+    # 注意/ポイント等のコールアウト(2列小型)は段落化
+    if (max(len(r) for r in rows) == 2 and len(rows) <= 5
+            and all((re.sub(r"\s+", "", r[0]) in CALLOUT_LABELS or not r[0].strip()) for r in rows)
+            and any(re.sub(r"\s+", "", r[0]) in CALLOUT_LABELS for r in rows)):
+        outs, label = [], next(re.sub(r"\s+", "", r[0]) for r in rows if r[0].strip())
+        for r in rows:
+            lbl = r[0].strip() or label
+            if len(r) > 1 and r[1].strip(): outs.append(f"**{lbl}**: {r[1].strip()}")
+        return "\n\n".join(outs) if outs else None
+    rows = _clean_cols(rows)
+    rows = [rows[0]] + [r for r in rows[1:] if any(c.strip() for c in r)]  # 全空行を除去
+    ncol = max((len(r) for r in rows), default=0)
+    if ncol < 2 or len(rows) < 2: return None
     filled = sum(1 for r in rows for c in r if c)
     fill = filled / (len(rows) * ncol)
     # 誤検出とみられる小規模・低充足の表はテキストに降格
     if len(rows) <= 3 and fill < 0.40:
         return "\n\n".join(": ".join(c for c in r if c) for r in rows if any(r))
     if len(rows) < 2 or fill < 0.2: return None
+    def clean(c):
+        if len(c) <= 8:
+            c = re.sub(r"(?<=[一-龥ぁ-んァ-ヴ]) (?=[一-龥ぁ-んァ-ヴ])", "", c)
+        if "「 」" in c and c.rstrip().endswith("_"):
+            c = c.replace("「 」", "「_」", 1)
+            c = re.sub(r"\s*_\s*$", "", c)
+        return re.sub(r"\s+", " ", c).strip()
+    rows = [[clean(c) for c in r] for r in rows]
     def esc(c): return c.replace("|", "\\|")
     md = "| " + " | ".join(esc(c) for c in rows[0]) + " |\n"
     md += "|" + "---|" * ncol + "\n"
@@ -345,35 +453,69 @@ def _rows_to_md(rows):
     return md
 
 def page_tables(page, vendor):
-    """表の検出→分割ヘッダの結合→Markdown化。[(bbox, md_or_text, is_table)]を返す"""
+    """表の検出→列クリーニング→ページ内結合。([(bbox, rows)], 図化bbox) を返す"""
     try:
         tf = page.find_tables()
     except Exception:
-        return []
-    raw = []
+        return [], []
+    try:
+        img_centers = [((i["bbox"][0]+i["bbox"][2])/2, (i["bbox"][1]+i["bbox"][3])/2)
+                       for i in page.get_image_info()]
+    except Exception:
+        img_centers = []
+    raw, as_figure = [], []
     for t in tf.tables:
         rows = _table_rows(t, vendor, page)
         if not rows: continue
-        raw.append([list(t.bbox), rows])
+        # コールアウト箱(注意/ポイント等)は表を経由せず本文テキスト化
+        labels = [re.sub(r"\s+", "", r[0]) for r in rows
+                  if r and r[0] and re.sub(r"\s+", "", r[0]) in CALLOUT_LABELS]
+        if labels and len(rows) <= 8:
+            bb = t.bbox
+            lns = []
+            for b in page.get_text("dict")["blocks"]:
+                if b["type"]: continue
+                for l in b["lines"]:
+                    lx0, ly0, lx1, ly1 = l["bbox"]
+                    if bb[0]-2 <= (lx0+lx1)/2 <= bb[2]+2 and bb[1]-2 <= (ly0+ly1)/2 <= bb[3]+2:
+                        lt = "".join(sp["text"] for sp in l["spans"]).strip()
+                        if lt and re.sub(r"\s+", "", lt) not in CALLOUT_LABELS:
+                            lns.append((ly0, lx0, lt))
+            lns.sort()
+            body = map_pua(vendor, join_lines([t3 for _, _, t3 in lns])).strip()
+            if body:
+                raw.append([list(t.bbox), [["__CALLOUT__" + labels[0], body]]])
+            continue
+        rows = _clean_cols(rows)
+        if not rows or max(len(r) for r in rows) < 2: continue
+        bb = list(t.bbox)
+        n_img = sum(1 for cx, cy in img_centers
+                    if bb[0] <= cx <= bb[2] and bb[1] <= cy <= bb[3])
+        body = [c for r in rows[1:] for c in r]
+        fill = (sum(1 for c in body if c) / len(body)) if body else 1.0
+        ncols = max(len(r) for r in rows)
+        if (n_img >= 2 and fill < 0.55) or (ncols >= 12 and fill < 0.30):
+            as_figure.append(bb)   # 記号/画像セル主体・図表(タイミング図等)は丸ごと図にする
+            continue
+        raw.append([bb, rows])
     raw.sort(key=lambda x: x[0][1])
-    # 縦に隣接し列数が同じ表を結合(ヘッダ分割対策)
     merged = []
     for bb, rows in raw:
         if merged:
             pbb, prows = merged[-1]
             same_cols = max(len(r) for r in rows) == max(len(r) for r in prows)
-            if (same_cols and 0 <= bb[1] - pbb[3] < 10
+            if (same_cols and 0 <= bb[1] - pbb[3] < 16
                     and abs(bb[0] - pbb[0]) < 20 and abs(bb[2] - pbb[2]) < 20):
                 prows.extend(rows)
                 pbb[2] = max(pbb[2], bb[2]); pbb[3] = bb[3]
                 continue
         merged.append([bb, rows])
-    out = []
-    for bb, rows in merged:
-        md = _rows_to_md(rows)
-        if md is None: continue
-        out.append((bb, md, md.lstrip().startswith("|")))
-    return out
+    return merged, as_figure
+
+def _header_like(row):
+    cells = [c for c in row if c]
+    return (len(cells) >= 2 and all(len(c) <= 22 for c in cells)
+            and not any("「" in c or "。" in c for c in cells))
 
 # ---------------------------------------------------------------- unit rendering
 def render_unit(doc, cfg, unit, next_unit, subheads):
@@ -384,17 +526,50 @@ def render_unit(doc, cfg, unit, next_unit, subheads):
     parts, started = [], bool(cfg.get("autostart")) or bool(unit.get("autostart"))
     title_n = norm(unit["num"] + unit["title"])
     next_n = norm(next_unit["num"] + next_unit["title"]) if next_unit else None
-    sub_by_norm = {norm(t): lv for (lv, t, pg) in subheads}
+    sub_by_norm = {norm(t): (lv, t) for (lv, t, pg) in subheads}
 
     key = norm(unit["num"]) + norm(unit["title"])[:10]
     last_py = None
+    tstate = {"idx": None, "rows": None, "ncol": 0, "page": -9, "y1": 0, "header": None}
     for pn in range(p_start, p_end+1):
         page = doc[pn]
-        tables = page_tables(page, unit["_vendor"])
-        figs = detect_figures(page, cfg, [bb for bb, _, _ in tables])
-        items = page_items(page, cfg, [bb for bb, _, _ in tables], figs)
-        for bb, md, is_tab in tables:
-            items.append([bb[1], bb[0], "table" if is_tab else "p", md, 0, False])
+        tables, fig_tables = page_tables(page, unit["_vendor"])
+        figs = detect_figures(page, cfg, [bb for bb, _ in tables])
+        for fb in fig_tables:
+            if not any(_overlap(fb, g) > 0.5*_area(fb) for g in figs):
+                figs.append(fb)
+        items = page_items(page, cfg, [bb for bb, _ in tables], figs)
+        body_top, body_bot = cfg["body_box"][1], cfg["body_box"][3]
+        for ti, (bb, rows) in enumerate(tables):
+            ncol = max(len(r) for r in rows)
+            # (a) ページ跨ぎ継続: 前ページ末尾の表に接続
+            if (ti == 0 and tstate["idx"] is not None and tstate["page"] == pn - 1
+                    and tstate["y1"] > body_bot - 60 and bb[1] < body_top + 60
+                    and ncol == tstate["ncol"]):
+                add = rows[1:] if (_header_like(rows[0]) and tstate["rows"]
+                                   and rows[0] == tstate["rows"][0]) else rows
+                if add and not _header_like(add[0]):
+                    tstate["rows"].extend(add)
+                    md2 = _rows_to_md(tstate["rows"])
+                    if md2 is not None:
+                        parts[tstate["idx"]] = (("table" if md2.lstrip().startswith("|") else "p"), md2)
+                    tstate.update(page=pn, y1=bb[3])
+                    continue
+            if rows and rows[0][0].startswith("__CALLOUT__"):
+                lbl = rows[0][0][len("__CALLOUT__"):]
+                items.append([bb[1], bb[0], "p", f"**{lbl}**: {rows[0][1]}", 0, False])
+                continue
+            # (b) ヘッダーなしデータ表: 単元内の直近ヘッダーを継承
+            if (not _header_like(rows[0]) and tstate["header"]
+                    and len(tstate["header"]) == ncol):
+                rows = [list(tstate["header"])] + rows
+            md = _rows_to_md(rows)
+            if md is None: continue
+            is_tab = md.lstrip().startswith("|")
+            items.append([bb[1], bb[0], "table" if is_tab else "p",
+                          md, 0, False, (bb, rows)])
+            if is_tab and _header_like(rows[0]):
+                tstate["header"] = list(rows[0])
         for fb in figs:
             md_img = render_figure(page, fb, unit["_vendor"], unit["slug"], unit["_figseq"], pn+1)
             if md_img:
@@ -403,7 +578,8 @@ def render_unit(doc, cfg, unit, next_unit, subheads):
         items.sort(key=lambda it: (round(it[0],1), it[1]))
 
         for it in items:
-            y, x, kind, text, sz, bold = it
+            y, x, kind, text, sz, bold = it[:6]
+            tmeta = it[6] if len(it) > 6 else None
             tn = norm(text)
             if pn > p_start and not started:
                 started = True
@@ -443,17 +619,35 @@ def render_unit(doc, cfg, unit, next_unit, subheads):
                             parts.append(("p", prefix))
                 return parts, started
             if kind == "table":
-                parts.append(("table", text)); last_py = None; continue
+                parts.append(("table", text)); last_py = None
+                if tmeta:
+                    tstate.update(idx=len(parts) - 1, rows=tmeta[1],
+                                  ncol=max(len(r) for r in tmeta[1]),
+                                  page=pn, y1=tmeta[0][3])
+                continue
             if kind == "img":
                 parts.append(("img", text)); last_py = None; continue
             # 見出し判定: TOC一致を優先、次にサイズ
-            matched = None
-            for k, lv in sub_by_norm.items():
+            matched = mk = mtitle = None
+            for k, (lv, ttl) in sub_by_norm.items():
                 if tn == k or (len(k) > 6 and tn.startswith(k)):
-                    matched = lv; break
+                    matched, mk, mtitle = lv, k, ttl; break
             if matched:
-                ht = re.sub(r"^((?:\d+|付\d*|A)(?:[.\-]\d+)*)(?=[^\d\s.\-])", r"\1 ", text.strip())
-                parts.append(("h", "#"*min(matched,5) + " " + ht))
+                if len(tn) > len(mk) + 8:
+                    # 見出し+本文が同一ブロック: norm消費位置で原文を分割
+                    consumed, cut = 0, len(text)
+                    for ci2, ch2 in enumerate(text):
+                        if norm(ch2): consumed += len(norm(ch2))
+                        if consumed >= len(mk):
+                            cut = ci2 + 1; break
+                    ht = re.sub(r"^((?:\d+|付\d*|A)(?:[.\-]\d+)*)(?=[^\d\s.\-])", r"\1 ",
+                                text[:cut].strip())
+                    parts.append(("h", "#"*min(matched,5) + " " + ht))
+                    rest = text[cut:].strip()
+                    if rest: parts.append(("p", rest))
+                else:
+                    ht = re.sub(r"^((?:\d+|付\d*|A)(?:[.\-]\d+)*)(?=[^\d\s.\-])", r"\1 ", text.strip())
+                    parts.append(("h", "#"*min(matched,5) + " " + ht))
                 continue
             # 「操作手順」ラベル付きブロックは見出しにせず分解
             if text.startswith("操作手順"):
@@ -504,19 +698,34 @@ PUA_MAP = {
         **PUA_MAP_COMMON,
         "\uf0c6": "○", "\uf0c7": "△", "\uf0c8": "×", "\uf0c9": "―",
         "\uf06f": "□",              # Wingdings 'o' プレースホルダ
-        "\uf0f0": " ⇒ ",            # Wingdings メニュー経路矢印
+        "\uf0f0": " ⇒ ",            # Wingdings メニュー経路矢印(丸数字ブロックより優先)
         "\uf0c0": "→ ",             # マニュアル参照アイコン
         "\uf0c1": "→ ",             # ページ参照アイコン
         "\uf0fb": "・",             # 機能項目アイコン
         "\uf083": "[Ctrl]", "\uf084": "[Shift]", "\uf08f": "[Enter]",
         "\uf081": "[Tab]", "\uf082": "[Alt]", "\uf085": "[Esc]", "\uf08c": "[Space]",
+        "\uf086": "[Insert]", "\uf087": "[Delete]", "\uf088": "[Home]",
         "\uf0bc": "[↑]", "\uf0bd": "[↓]", "\uf0be": "[←]", "\uf0bf": "[→]",
+        # ファンクションキー/文字キー(MitsubishiManualfont)
+        **{chr(0xf0a0 + i): f"[F{i}]" for i in range(1, 13)},
+        **{chr(0xf041 + i): f"[{chr(65 + i)}]" for i in range(26)},
+        **{chr(0xf030 + i): f"[{i}]" for i in range(10)},
+        "\uf02c": "[,]", "\uf02e": "[.]", "\uf02f": "[/]", "\uf03d": "[=]",
+        # 丸数字(列挙)
+        **{chr(0xf0f0 + i): "①②③④⑤⑥⑦⑧⑨"[i - 1] for i in range(1, 10)},
+        "\uf0fa": "・",
+        # Symbol系
+        "\uf06d": "μ", "\uf0a3": "≤", "\uf0a5": "∞", "\uf0ab": "↔",
+        "\uf0b1": "±", "\uf0b4": "×", "\uf0e2": "®", "\uf0e3": "©", "\uf0e4": "™",
+        # Wingdings3
+        "\uf070": "▲", "\uf071": "▼",
     },
     "kvstudio": {
         **PUA_MAP_COMMON,
         "\uf06c": "●", "\uf06e": "■",   # Wingdings l/n
         "\uf075": "►", "\uf067": "→",   # Wingdings3(Codex裏取り済)
         "\uf0ac": "←", "\uf0ad": "↑", "\uf0af": "↓",  # Symbol矢印系
+        "\uf07c": "|",
     },
     "sysmac": dict(PUA_MAP_COMMON),
 }
@@ -564,6 +773,7 @@ def postprocess(vendor, parts):
                 t = text[1:].strip()
                 text = f"**{t}**" if len(t) < 60 else t
         text = re.sub(r"→ *→ *", "→ ", text)
+        text = re.sub(r"(?<![0-9A-Za-z])_\s+(?=[0-9A-Za-z□])", "_", text)
         text = re.sub(r"(?<![0-9A-Za-z_()])_ ?_(?![0-9A-Za-z_()])", " ", text)
         text = re.sub(r"[・.]{3,}", " ", text).strip()
         if not text: continue
@@ -613,7 +823,13 @@ def to_markdown(vendor, cfg, unit, parts):
              "---", "",
              f'# {unit["num"]} {unit["title"]}', ""]
     prev = None
-    for kind, text in parts:
+    for idx, (kind, text) in enumerate(parts):
+        if kind == "p" and idx + 1 < len(parts) and parts[idx+1][0] == "table":
+            hdr = parts[idx+1][1].split("\n")[0]
+            hcells = "".join(x.strip() for x in hdr.strip("|").split("|"))
+            tn2 = re.sub(r"\s+", "", text)
+            if hcells and (tn2 == hcells or tn2.startswith(hcells) and len(tn2) - len(hcells) <= 12):
+                continue
         if kind == "h":
             lines += ["", text, ""]
         elif kind in ("table", "img"):
