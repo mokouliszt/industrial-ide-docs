@@ -737,6 +737,100 @@ def map_pua(vendor, text):
 
 PUA = re.compile(r"[\ue000-\uf8ff]")
 
+def repair_markdown_structure(parts):
+    """PDFの段組みで混線しやすい見出し・手順番号をMarkdown向けに補正する。"""
+    repaired = []
+    strip_icon_close = False
+    seen_headings = set()
+    skip_indexes = set()
+
+    def append_reference(prefix):
+        """図を挟んで分断された「(→ 参照先)」を直前の手順へ戻す。"""
+        pidx = len(repaired) - 1
+        if pidx >= 0 and repaired[pidx][0] == "img":
+            pidx -= 1
+        if pidx < 0 or repaired[pidx][0] != "p":
+            return False
+        prev = repaired[pidx][1]
+        open_paren = prev.count("(") + prev.count("（")
+        close_paren = prev.count(")") + prev.count("）")
+        is_reference_tail = open_paren > close_paren and prefix.endswith((")", "）"))
+        is_detached_reference = prefix.startswith(("(→", "（→"))
+        is_reference_subject = prev.startswith("→ ") and prefix.startswith(
+            ("が", "を", "に", "の", "と", "で")
+        )
+        if not (is_reference_tail or is_detached_reference or is_reference_subject):
+            return False
+        sep = " " if is_detached_reference and not prev.endswith((" ", "(", "（")) else ""
+        repaired[pidx] = ("p", prev + sep + prefix)
+        return True
+
+    for index, (kind, text) in enumerate(parts):
+        if index in skip_indexes:
+            continue
+        if kind != "img":
+            # UIラベル直後の空リンクはPDF中のアイコンが誤ってリンク化されたもの。
+            text = re.sub(r"\]\(\s*(?::|：)?\s*\)", "]", text)
+        if strip_icon_close and kind == "p":
+            text = re.sub(r"^[)）]\s*", "", text)
+            strip_icon_close = False
+
+        if kind == "h":
+            plain = re.sub(r"^#{1,6}\s+", "", text).strip()
+            # 同一ページ内で再出した大きなUIラベルが、後続文の主語として
+            # 誤って見出し化された場合は段落へ戻す。
+            next_part = parts[index + 1] if index + 1 < len(parts) else None
+            continuation = (r"^(?:の|から|を|に|で|が|へ|と|機能を|すると|して|した|の場合|"
+                            r"では|は[、 ]|、|後|時|前|中|内|[／/]|メニューから)")
+            generic_repeatable = {"注意事項", "操作手順", "ポイント", "参考", "重要", "警告"}
+            if (plain in seen_headings and plain not in generic_repeatable
+                    and next_part and next_part[0] == "p"
+                    and re.match(continuation, next_part[1])):
+                sep = "： " if next_part[1].startswith("メニューから") else ""
+                kind, text = "p", plain + sep + next_part[1]
+                skip_indexes.add(index + 1)
+            else:
+                seen_headings.add(plain)
+            # 「参照先) 2. 次の手順」のような本文は見出しにしない。
+            step = re.match(r"^(.+?)([1-9]\d?)\.\s*([^\d.].*)$", plain)
+            icon_step = re.match(r"^([1-9]\d?)\s*(.+?)[(（]\s*$", plain)
+            if step and not plain[:1].isdigit():
+                prefix, number, body = (v.strip() for v in step.groups())
+                if prefix and not append_reference(prefix):
+                    repaired.append(("p", prefix))
+                kind, text = "p", f"{number}. {body}"
+            elif icon_step:
+                number, body = (v.strip() for v in icon_step.groups())
+                kind, text = "p", f"{number}. {body}"
+                strip_icon_close = True
+            elif plain.endswith(("。", "ます", "ません")):
+                kind, text = "p", plain
+            elif repaired and repaired[-1] == (kind, text):
+                continue
+
+        if kind == "p":
+            text = re.sub(r"^([1-9]\d?)\.\s*\.(?=\s*[^\d.])\s*", r"\1. ", text)
+            text = re.sub(r"^([1-9]\d?)\.(?=[^\d.\s])", r"\1. ", text)
+            # 同じPDFテキストブロックに連結された後続手順を独立させる。
+            # 「。2ファイル名を…」のようにピリオドまで欠落した番号も対象にするが、
+            # 「。2つ」「。3秒」など通常の数量表現は分割しない。
+            counters = (r"つ|台|個|点|回|件|種類|次元|文字|進数|ワード|ビット|軸|"
+                        r"ページ|秒|分|時間|サイクル|スキャン|製品|号機|重|倍|行|列|"
+                        r"段|章|節|項|年|月|日")
+            marker = rf"[1-9]\d?(?:\.\s*|\s*)(?!(?:{counters}))(?=[^\W\d_［【「『]|[［【「『])"
+            segments = re.split(rf"(?<=[。！？)）」])\s*(?={marker})", text)
+            if len(segments) > 1:
+                for seg in segments:
+                    seg = seg.strip()
+                    if not seg:
+                        continue
+                    seg = re.sub(rf"^([1-9]\d?)(?:\.\s*|\s*)(?!(?:{counters}))", r"\1. ", seg)
+                    repaired.append(("p", seg))
+                continue
+
+        repaired.append((kind, text))
+    return repaired
+
 def postprocess(vendor, parts):
     out, buf_num = [], None
     for kind, text in parts:
@@ -762,6 +856,10 @@ def postprocess(vendor, parts):
         elif vendor == "kvstudio":
             text = re.sub(r"[（(]\s*\d+ページ\s*[）)]", "", text)
             text = re.sub(r"「?\d+ページ\s+", "→ ", text)
+            # 左欄の「参考」ラベルが本文の途中へ混入するPDF抽出ノイズを除去。
+            if re.match(r"^参\s+考", text):
+                text = re.sub(r"^参\s+考\s*[：:]?\s*", "**参考**: ", text)
+            text = re.sub(r"参\s+考", "", text)
         text = PUA.sub("", text)
         text = re.sub(r"[ \t]+", lambda m: " ", text).strip()
         if not text: continue
@@ -809,7 +907,7 @@ def postprocess(vendor, parts):
                 merged[-1] = ("p", prev + text)
                 continue
         merged.append((kind, text))
-    return merged
+    return repair_markdown_structure(merged)
 
 def to_markdown(vendor, cfg, unit, parts):
     lines = ["---",

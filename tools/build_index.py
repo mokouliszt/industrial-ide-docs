@@ -2,7 +2,7 @@
 """content/*.md を走査して nav.json / search-index.json / llms.txt を生成"""
 import os, re, json, glob
 
-ROOT = "/home/claude/work2/user-site/public"
+ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "public"))
 CONTENT = f"{ROOT}/content"
 
 CATEGORIES = [
