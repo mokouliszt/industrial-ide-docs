@@ -50,6 +50,8 @@ themselves are not included).
 ```bash
 pip install pymupdf
 python tools/extract.py <gxworks3|kvstudio|sysmac>  # adjust SRC in the script for the PDF path
+python tools/polish_content.py                       # repair PDF line wraps / labels / section overlap
+python tools/audit_content.py                        # validate UTF-8, headings, tables and image links
 python tools/build_index.py                          # regenerate nav / search / llms.txt
 npm run build                                        # regenerate static HTML
 ```

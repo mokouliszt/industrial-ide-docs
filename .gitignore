@@ -4,3 +4,5 @@ dist-ssr
 *.log
 nohup.out
 tsconfig.tsbuildinfo
+__pycache__/
+*.pyc

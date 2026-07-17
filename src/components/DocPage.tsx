@@ -145,8 +145,8 @@ export function DocPage() {
       {md !== null && vendor !== "common" && (
         <footer className="mt-10 rounded-md border border-paper-line bg-paper-panel/60 px-4 py-3 text-[12px] leading-5 text-ink-faint">
           <BookOpen className="mr-1.5 inline h-3.5 w-3.5 align-[-2px]" />
-          本ページは元マニュアルの該当節を機械抽出・再構成したものです(図は元PDFから切り出し)。
-          抽出漏れや厳密な確認が必要な場合は各社の元マニュアルを参照してください。
+          本ページは各社の公開マニュアルを基に、検索・参照しやすい構成へ再整理した技術リファレンスです。
+          機種・版による差分や安全上の判断は、出典欄の公式マニュアルで確認してください。
           <a className="ml-1 inline-flex items-center gap-0.5 underline underline-offset-2" href={`${import.meta.env.BASE_URL}content/${vendor}/${slug}.md`}>
             Markdown原文 <ExternalLink className="h-3 w-3" />
           </a>
